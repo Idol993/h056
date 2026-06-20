@@ -21,6 +21,8 @@ def setup_logging(verbose: bool = False):
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
 
+    root_logger.handlers.clear()
+
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.WARNING)
     console_handler.setFormatter(logging.Formatter(log_format))
@@ -38,22 +40,39 @@ def setup_logging(verbose: bool = False):
 
 
 def print_error(msg: str):
-    click.echo(click.style(f"[错误] {msg}", fg="red"), err=True)
+    try:
+        click.echo(click.style(f"[错误] {msg}", fg="red"), err=True)
+    except Exception:
+        click.echo(f"[错误] {msg}", err=True)
 
 
 def print_success(msg: str):
-    click.echo(click.style(msg, fg="green"))
+    try:
+        click.echo(click.style(msg, fg="green"))
+    except Exception:
+        click.echo(msg)
 
 
 def print_answer(msg: str):
-    click.echo(click.style(msg, fg="white"))
+    try:
+        click.echo(click.style(msg, fg="white"))
+    except Exception:
+        click.echo(msg)
 
 
 def print_source(file: str, page: Optional[int], snippet: str):
     location = f"{file}"
     if page:
         location += f":{page}"
-    click.echo(click.style(f"  - [{location}] {snippet[:100]}...", fg="#808080"))
+    safe_snippet = (snippet or "")[:100].replace("\n", " ")
+    display = f"  - [{location}] {safe_snippet}..."
+    try:
+        click.echo(click.style(display, fg="bright_black"))
+    except Exception:
+        try:
+            click.echo(click.style(display, dim=True))
+        except Exception:
+            click.echo(display)
 
 
 @click.group()
@@ -70,44 +89,39 @@ def cli(ctx: click.Context, verbose: bool):
               help=f"文件或目录路径，默认: {UPLOAD_DIR}")
 @click.option("--clear", "-c", is_flag=True, help="摄入前清空向量库")
 def ingest(path: Optional[str], clear: bool):
-    from docurag.ingestion import DocumentLoader, Embedder, TextSplitter
-    from docurag.retrieval import VectorStore
+    from docurag.ingestion import IngestionPipeline
 
     try:
-        loader = DocumentLoader()
-        splitter = TextSplitter()
-        embedder = Embedder()
-        vector_store = VectorStore()
+        pipeline = IngestionPipeline()
 
-        if clear:
-            vector_store.clear()
-            print_success("向量库已清空")
+        def _progress(msg: str):
+            click.echo(f"  {msg}")
 
         target_path = Path(path) if path else UPLOAD_DIR
-        click.echo(f"正在加载文档: {target_path}")
 
         if target_path.is_file():
-            raw_chunks = loader.load_file(target_path)
+            click.echo(f"正在摄入文件: {target_path}")
+            result = pipeline.ingest_file(target_path, progress_cb=_progress)
+            if result.success:
+                print_success(f"{result.message}")
+            else:
+                print_error(result.message)
+                sys.exit(1)
         elif target_path.is_dir():
-            raw_chunks = loader.load_directory(target_path)
+            click.echo(f"正在摄入目录: {target_path}")
+            result = pipeline.ingest_directory(target_path, clear_first=clear, progress_cb=_progress)
+            if result.success:
+                print_success(result.message)
+                if result.processed_files:
+                    click.echo(f"  已处理: {', '.join(result.processed_files)}")
+                if result.skipped_files:
+                    click.echo(f"  已跳过: {', '.join(result.skipped_files)}")
+            else:
+                print_error(result.message)
+                sys.exit(1)
         else:
             print_error(f"路径不存在: {target_path}")
             sys.exit(1)
-
-        if not raw_chunks:
-            print_error("未加载到任何文档内容")
-            sys.exit(1)
-
-        click.echo(f"加载了 {len(raw_chunks)} 个文档块，正在切分...")
-        split_chunks = splitter.split(raw_chunks)
-        click.echo(f"切分为 {len(split_chunks)} 个文本片段，正在向量化...")
-
-        embeddings = embedder.embed_chunks(split_chunks)
-        click.echo(f"向量化完成，正在存入向量库...")
-
-        vector_store.add_documents(split_chunks, embeddings)
-        total = vector_store.count()
-        print_success(f"文档摄入完成！向量库共 {total} 条记录")
 
     except Exception as e:
         logging.exception("文档摄入失败")
@@ -149,9 +163,15 @@ def query(question: str, no_stream: bool, filter_file: Optional[str]):
         click.echo(click.style("\n答案:", fg="cyan", bold=True))
 
         if no_stream:
-            answer = llm_client.generate(prompt, stream=False)
-            print_answer(answer)
+            try:
+                answer = llm_client.generate(prompt, stream=False)
+                print_answer(answer or "未找到相关信息")
+            except Exception as e:
+                logging.exception("LLM 调用失败")
+                print_error(f"生成答案失败: {e}")
+                answer = ""
         else:
+            answer = ""
             try:
                 from rich.console import Console
                 from rich.live import Live
@@ -162,20 +182,47 @@ def query(question: str, no_stream: bool, filter_file: Optional[str]):
                 text = Text(accumulated)
 
                 with Live(text, console=console, refresh_per_second=10) as live:
-                    stream = llm_client.generate(prompt, stream=True)
-                    if stream:
-                        for token in stream:
-                            accumulated += token
-                            text = Text(accumulated)
-                            live.update(text)
+                    try:
+                        stream = llm_client.generate(prompt, stream=True)
+                        if stream:
+                            for token in stream:
+                                accumulated += token
+                                text = Text(accumulated)
+                                live.update(text)
+                    except Exception as inner_e:
+                        accumulated += f"\n[生成中断: {inner_e}]"
+                        text = Text(accumulated)
+                        live.update(text)
+                answer = accumulated
                 click.echo()
             except ImportError:
-                answer = llm_client.generate(prompt, stream=False)
-                print_answer(answer)
+                try:
+                    answer = llm_client.generate(prompt, stream=False)
+                    print_answer(answer or "未找到相关信息")
+                except Exception as e:
+                    logging.exception("LLM 调用失败")
+                    print_error(f"生成答案失败: {e}")
+                    answer = ""
 
-        click.echo(click.style("\n引用来源:", fg="cyan", bold=True))
-        for src in sources:
-            print_source(src["file"], src["page"], src["snippet"])
+        click.echo()
+        try:
+            click.echo(click.style("引用来源:", fg="cyan", bold=True))
+        except Exception:
+            click.echo("引用来源:")
+
+        if sources:
+            for src in sources:
+                try:
+                    print_source(src.get("file", "?"), src.get("page"), src.get("snippet", ""))
+                except Exception as e:
+                    logging.debug(f"打印来源失败: {e}")
+                    location = src.get("file", "?")
+                    if src.get("page"):
+                        location += f":{src['page']}"
+                    s = (src.get("snippet") or "")[:80]
+                    click.echo(f"  - [{location}] {s}...")
+        else:
+            click.echo("  (无来源)")
 
     except Exception as e:
         logging.exception("查询失败")
@@ -186,12 +233,20 @@ def query(question: str, no_stream: bool, filter_file: Optional[str]):
 @cli.command()
 @click.option("--host", "-h", default="127.0.0.1", help="监听地址")
 @click.option("--port", "-p", default=8000, type=int, help="监听端口")
-def serve(host: str, port: int):
+@click.option("--no-watch", is_flag=True, help="禁用 uploads 目录自动监听")
+def serve(host: str, port: int, no_watch: bool):
     import uvicorn
+    from docurag.api import set_auto_watch
+
+    set_auto_watch(not no_watch)
+
     click.echo(f"启动 DocuRAG API 服务: http://{host}:{port}")
     click.echo(f"  POST /query    - 问答接口")
     click.echo(f"  GET  /ingest   - 触发文档摄入")
     click.echo(f"  GET  /status   - 查看状态")
+    if not no_watch:
+        click.echo(f"  自动监听: {UPLOAD_DIR} (新增/修改文件自动摄入)")
+
     uvicorn.run("docurag.api:app", host=host, port=port, reload=False)
 
 
@@ -205,8 +260,11 @@ def list_files():
         total = vector_store.count()
 
         click.echo(f"向量库共 {total} 条记录，来自 {len(files)} 个文件:")
-        for f in files:
-            click.echo(f"  - {f}")
+        if files:
+            for f in files:
+                click.echo(f"  - {f}")
+        else:
+            click.echo("  (空库)")
     except Exception as e:
         logging.exception("获取文件列表失败")
         print_error(str(e))
@@ -214,7 +272,11 @@ def list_files():
 
 
 def main():
-    cli(obj={})
+    try:
+        cli(obj={})
+    except KeyboardInterrupt:
+        click.echo("\n已取消")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

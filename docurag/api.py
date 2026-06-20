@@ -1,5 +1,6 @@
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -10,7 +11,55 @@ from docurag.config import UPLOAD_DIR
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="DocuRAG API", version="0.1.0")
+_AUTO_WATCH = True
+_watcher = None
+_pipeline = None
+
+
+def set_auto_watch(enabled: bool):
+    global _AUTO_WATCH
+    _AUTO_WATCH = enabled
+
+
+def _get_pipeline():
+    global _pipeline
+    if _pipeline is None:
+        from docurag.ingestion import IngestionPipeline
+        _pipeline = IngestionPipeline()
+    return _pipeline
+
+
+def _start_watcher():
+    global _watcher
+    if _watcher is not None or not _AUTO_WATCH:
+        return
+    try:
+        from docurag.ingestion.watcher import DirectoryWatcher
+        _watcher = DirectoryWatcher(watch_dir=UPLOAD_DIR, pipeline=_get_pipeline())
+        _watcher.start()
+        logger.info("API 服务启动，uploads 目录自动监听已开启")
+    except Exception as e:
+        logger.warning(f"目录监听器启动失败: {e}")
+
+
+def _stop_watcher():
+    global _watcher
+    if _watcher is not None:
+        try:
+            _watcher.stop()
+        except Exception:
+            pass
+        _watcher = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _start_watcher()
+    yield
+    _stop_watcher()
+
+
+app = FastAPI(title="DocuRAG API", version="0.1.0", lifespan=lifespan)
 
 
 class QueryRequest(BaseModel):
@@ -28,12 +77,15 @@ class IngestResponse(BaseModel):
     status: str
     message: str
     total_documents: int
+    processed_files: list[str] = []
+    skipped_files: list[str] = []
 
 
 class StatusResponse(BaseModel):
     status: str
     total_documents: int
     files: list[str]
+    watching: bool
 
 
 def _get_retriever():
@@ -53,7 +105,8 @@ def get_status():
         return StatusResponse(
             status="ok",
             total_documents=vector_store.count(),
-            files=vector_store.list_files()
+            files=vector_store.list_files(),
+            watching=(_watcher is not None and _watcher._running)
         )
     except Exception as e:
         logger.exception(f"获取状态失败: {e}")
@@ -62,32 +115,25 @@ def get_status():
 
 @app.get("/ingest", response_model=IngestResponse)
 def ingest_documents():
-    from docurag.ingestion import DocumentLoader, Embedder, TextSplitter
-    from docurag.retrieval import VectorStore
-
     try:
-        loader = DocumentLoader()
-        splitter = TextSplitter()
-        embedder = Embedder()
-        vector_store = VectorStore()
+        pipeline = _get_pipeline()
+        result = pipeline.ingest_directory(UPLOAD_DIR, clear_first=False)
 
-        raw_chunks = loader.load_directory(UPLOAD_DIR)
-        if not raw_chunks:
+        if not result.processed_files and not result.skipped_files:
             return IngestResponse(
                 status="warning",
-                message=f"目录 {UPLOAD_DIR} 中没有找到可摄入的文档",
-                total_documents=vector_store.count()
+                message=result.message,
+                total_documents=result.total_chunks,
+                processed_files=[],
+                skipped_files=[]
             )
 
-        split_chunks = splitter.split(raw_chunks)
-        embeddings = embedder.embed_chunks(split_chunks)
-        vector_store.add_documents(split_chunks, embeddings)
-
-        total = vector_store.count()
         return IngestResponse(
-            status="success",
-            message=f"成功摄入 {len(split_chunks)} 个文本片段",
-            total_documents=total
+            status="success" if result.success else "partial",
+            message=result.message,
+            total_documents=result.total_chunks,
+            processed_files=result.processed_files,
+            skipped_files=result.skipped_files
         )
     except Exception as e:
         logger.exception(f"文档摄入失败: {e}")
@@ -118,12 +164,10 @@ def query(request: QueryRequest):
             prompt = prompt_builder.build(request.question, retrieved)
 
             def generate_stream():
-                full_answer = ""
                 try:
                     stream = llm_client.generate(prompt, stream=True)
                     if stream:
                         for token in stream:
-                            full_answer += token
                             yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
                     yield f"data: {json.dumps({'done': True, 'sources': sources}, ensure_ascii=False)}\n\n"
                 except Exception as e:
