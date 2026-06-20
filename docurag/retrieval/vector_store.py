@@ -1,10 +1,12 @@
 import hashlib
+import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import chromadb
 from chromadb.config import Settings
@@ -32,7 +34,26 @@ class FileInfo:
     file_hash: str = ""
     updated_at: float = 0.0
     exists_in_uploads: bool = False
+    last_ingest_status: str = ""
+    last_ingest_error: str = ""
+    prev_chunk_count: int = 0
+    prev_file_hash: str = ""
     metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class DoctorReport:
+    upload_dir: str
+    db_dir: str
+    watcher_running: bool
+    total_in_uploads: int
+    total_in_db: int
+    orphan_files: List[str] = field(default_factory=list)
+    missing_files: List[str] = field(default_factory=list)
+    stale_files: List[str] = field(default_factory=list)
+    empty_files: List[str] = field(default_factory=list)
+    unsupported_files: List[str] = field(default_factory=list)
+    hash_mismatch: List[str] = field(default_factory=list)
 
 
 def compute_file_hash(file_path: str | Path) -> str:
@@ -40,21 +61,32 @@ def compute_file_hash(file_path: str | Path) -> str:
     if not path.exists():
         return ""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(65536)
-            if not chunk:
-                break
-            h.update(chunk)
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except Exception:
+        return ""
     return h.hexdigest()
+
+
+_STATE_DIR_NAME = "_docurag_state"
+_STATE_FILE_NAME = "ingest_state.json"
 
 
 class VectorStore:
     def __init__(self, persist_dir: str | Path = CHROMA_DB_DIR, collection_name: str = CHROMA_COLLECTION_NAME):
         self.persist_dir = str(persist_dir)
         self.collection_name = collection_name
+        self._state_dir = os.path.join(self.persist_dir, _STATE_DIR_NAME)
+        self._state_file = os.path.join(self._state_dir, _STATE_FILE_NAME)
         self._client = None
         self._collection = None
+        self._state: Dict[str, Any] = {}
+        self._load_state()
 
     def _get_client(self):
         if self._client is None:
@@ -73,6 +105,49 @@ class VectorStore:
                 metadata={"hnsw:space": "cosine"}
             )
         return self._collection
+
+    def _load_state(self):
+        try:
+            os.makedirs(self._state_dir, exist_ok=True)
+            if os.path.exists(self._state_file):
+                with open(self._state_file, "r", encoding="utf-8") as f:
+                    self._state = json.load(f)
+        except Exception as e:
+            logger.warning(f"加载状态文件失败: {e}")
+            self._state = {}
+
+    def _save_state(self):
+        try:
+            os.makedirs(self._state_dir, exist_ok=True)
+            with open(self._state_file, "w", encoding="utf-8") as f:
+                json.dump(self._state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存状态文件失败: {e}")
+
+    def set_file_ingest_state(
+        self,
+        filename: str,
+        status: str,
+        error: str = "",
+        chunk_count: int = 0,
+        file_hash: str = "",
+        prev_chunk_count: int = 0,
+        prev_file_hash: str = ""
+    ):
+        self._state.setdefault("files", {})
+        self._state["files"][filename] = {
+            "status": status,
+            "error": error,
+            "chunk_count": chunk_count,
+            "file_hash": file_hash,
+            "prev_chunk_count": prev_chunk_count,
+            "prev_file_hash": prev_file_hash,
+            "timestamp": time.time()
+        }
+        self._save_state()
+
+    def get_file_ingest_state(self, filename: str) -> Optional[dict]:
+        return self._state.get("files", {}).get(filename)
 
     def count(self) -> int:
         collection = self._get_collection()
@@ -130,10 +205,28 @@ class VectorStore:
         self,
         query_embedding: np.ndarray,
         top_k: int = 10,
-        filter_file: Optional[str] = None
+        filter_file: Optional[str] = None,
+        filter_ext: Optional[str] = None,
+        updated_after: Optional[float] = None,
+        updated_before: Optional[float] = None,
     ) -> List[RetrievedChunk]:
         collection = self._get_collection()
-        where = {"source_file": filter_file} if filter_file else None
+
+        where = {}
+        if filter_file:
+            where["source_file"] = filter_file
+        if filter_ext:
+            where["source_file"] = {"$contains": filter_ext}
+        if updated_after or updated_before:
+            ts_cond = {}
+            if updated_after:
+                ts_cond["$gte"] = float(updated_after)
+            if updated_before:
+                ts_cond["$lte"] = float(updated_before)
+            where["updated_at"] = ts_cond
+
+        if not where:
+            where = None
 
         query_vec = query_embedding.tolist() if isinstance(query_embedding, np.ndarray) else query_embedding
 
@@ -147,6 +240,12 @@ class VectorStore:
         if results and results["ids"] and results["ids"][0]:
             for i in range(len(results["ids"][0])):
                 metadata = results["metadatas"][0][i] if results["metadatas"] else {}
+
+                if filter_ext:
+                    src_file = metadata.get("source_file", "")
+                    if not src_file.lower().endswith(filter_ext.lower()):
+                        continue
+
                 page = metadata.get("page")
                 if page == -1:
                     page = None
@@ -167,6 +266,9 @@ class VectorStore:
         if results and results["ids"]:
             collection.delete(ids=results["ids"])
             logger.info(f"已删除文件 {filename} 的 {len(results['ids'])} 条向量记录")
+        if "files" in self._state and filename in self._state["files"]:
+            del self._state["files"][filename]
+            self._save_state()
 
     def get_file_hash(self, filename: str) -> Optional[str]:
         collection = self._get_collection()
@@ -195,6 +297,19 @@ class VectorStore:
         collection = self._get_collection()
         results = collection.get(where={"source_file": filename})
         if not results or not results["ids"]:
+            ingest_state = self.get_file_ingest_state(filename)
+            if ingest_state:
+                return FileInfo(
+                    filename=filename,
+                    chunk_count=0,
+                    file_hash="",
+                    updated_at=0.0,
+                    exists_in_uploads=(upload_dir / filename).exists() if upload_dir else False,
+                    last_ingest_status=ingest_state.get("status", ""),
+                    last_ingest_error=ingest_state.get("error", ""),
+                    prev_chunk_count=ingest_state.get("prev_chunk_count", 0),
+                    prev_file_hash=ingest_state.get("prev_file_hash", ""),
+                )
             return None
 
         chunk_count = len(results["ids"])
@@ -213,12 +328,18 @@ class VectorStore:
         if upload_dir:
             exists_in_uploads = (upload_dir / filename).exists()
 
+        ingest_state = self.get_file_ingest_state(filename) or {}
+
         return FileInfo(
             filename=filename,
             chunk_count=chunk_count,
             file_hash=file_hash,
             updated_at=updated_at,
             exists_in_uploads=exists_in_uploads,
+            last_ingest_status=ingest_state.get("status", ""),
+            last_ingest_error=ingest_state.get("error", ""),
+            prev_chunk_count=ingest_state.get("prev_chunk_count", 0),
+            prev_file_hash=ingest_state.get("prev_file_hash", ""),
             metadata=meta_sample
         )
 
@@ -249,4 +370,6 @@ class VectorStore:
         except Exception:
             pass
         self._collection = None
+        self._state = {}
+        self._save_state()
         logger.info("向量库已清空")
