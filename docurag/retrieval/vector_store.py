@@ -25,6 +25,32 @@ class RetrievedChunk:
     page: Optional[int]
     score: float
     metadata: dict
+    vector_score: float = 0.0
+    rerank_score: Optional[float] = None
+    rank: int = 0
+
+
+@dataclass
+class RetrieveDebugInfo:
+    filters_applied: dict
+    matched_files: List[str]
+    total_chunks_before_rerank: int = 0
+    total_chunks_after_rerank: int = 0
+    vector_top_k: int = 0
+    rerank_top_k: int = 0
+    enable_reranking: bool = False
+
+
+@dataclass
+class IngestHistoryEntry:
+    timestamp: float
+    status: str
+    chunk_count: int
+    chunk_delta: int
+    file_hash: str
+    prev_file_hash: str
+    source: str
+    error: str = ""
 
 
 @dataclass
@@ -132,8 +158,10 @@ class VectorStore:
         chunk_count: int = 0,
         file_hash: str = "",
         prev_chunk_count: int = 0,
-        prev_file_hash: str = ""
+        prev_file_hash: str = "",
+        source: str = "manual"
     ):
+        ts = time.time()
         self._state.setdefault("files", {})
         self._state["files"][filename] = {
             "status": status,
@@ -142,12 +170,75 @@ class VectorStore:
             "file_hash": file_hash,
             "prev_chunk_count": prev_chunk_count,
             "prev_file_hash": prev_file_hash,
-            "timestamp": time.time()
+            "timestamp": ts,
+            "source": source,
         }
+
+        self._state.setdefault("history", {})
+        self._state["history"].setdefault(filename, [])
+        entry = {
+            "timestamp": ts,
+            "status": status,
+            "chunk_count": chunk_count,
+            "chunk_delta": chunk_count - prev_chunk_count,
+            "file_hash": file_hash,
+            "prev_file_hash": prev_file_hash,
+            "source": source,
+            "error": error,
+        }
+        self._state["history"][filename].append(entry)
+        if len(self._state["history"][filename]) > 50:
+            self._state["history"][filename] = self._state["history"][filename][-50:]
+
         self._save_state()
 
     def get_file_ingest_state(self, filename: str) -> Optional[dict]:
         return self._state.get("files", {}).get(filename)
+
+    def append_ingest_history(
+        self,
+        filename: str,
+        status: str,
+        chunk_count: int = 0,
+        prev_chunk_count: int = 0,
+        file_hash: str = "",
+        prev_file_hash: str = "",
+        source: str = "manual",
+        error: str = "",
+    ):
+        ts = time.time()
+        self._state.setdefault("history", {})
+        self._state["history"].setdefault(filename, [])
+        entry = {
+            "timestamp": ts,
+            "status": status,
+            "chunk_count": chunk_count,
+            "chunk_delta": chunk_count - prev_chunk_count,
+            "file_hash": file_hash,
+            "prev_file_hash": prev_file_hash,
+            "source": source,
+            "error": error,
+        }
+        self._state["history"][filename].append(entry)
+        if len(self._state["history"][filename]) > 50:
+            self._state["history"][filename] = self._state["history"][filename][-50:]
+        self._save_state()
+
+    def get_ingest_history(self, filename: str, limit: int = 10) -> List[IngestHistoryEntry]:
+        raw_list = self._state.get("history", {}).get(filename, [])
+        result = []
+        for raw in reversed(raw_list[-limit:]):
+            result.append(IngestHistoryEntry(
+                timestamp=raw.get("timestamp", 0.0),
+                status=raw.get("status", ""),
+                chunk_count=raw.get("chunk_count", 0),
+                chunk_delta=raw.get("chunk_delta", 0),
+                file_hash=raw.get("file_hash", ""),
+                prev_file_hash=raw.get("prev_file_hash", ""),
+                source=raw.get("source", "manual"),
+                error=raw.get("error", ""),
+            ))
+        return result
 
     def count(self) -> int:
         collection = self._get_collection()
@@ -212,52 +303,74 @@ class VectorStore:
     ) -> List[RetrievedChunk]:
         collection = self._get_collection()
 
-        where = {}
+        conds = []
         if filter_file:
-            where["source_file"] = filter_file
+            conds.append({"source_file": filter_file})
         if filter_ext:
-            where["source_file"] = {"$contains": filter_ext}
+            conds.append({"source_file": {"$contains": filter_ext.lstrip(".")}})
         if updated_after or updated_before:
             ts_cond = {}
             if updated_after:
                 ts_cond["$gte"] = float(updated_after)
             if updated_before:
                 ts_cond["$lte"] = float(updated_before)
-            where["updated_at"] = ts_cond
+            conds.append({"updated_at": ts_cond})
 
-        if not where:
+        if len(conds) == 1:
+            where = conds[0]
+        elif len(conds) > 1:
+            where = {"$and": conds}
+        else:
             where = None
 
         query_vec = query_embedding.tolist() if isinstance(query_embedding, np.ndarray) else query_embedding
 
-        results = collection.query(
-            query_embeddings=[query_vec],
-            n_results=top_k,
-            where=where
-        )
+        try:
+            results = collection.query(
+                query_embeddings=[query_vec],
+                n_results=top_k,
+                where=where
+            )
+        except Exception as e:
+            logger.warning(f"向量检索 with where 失败，回退到无过滤检索后软件过滤: {e}")
+            results = collection.query(
+                query_embeddings=[query_vec],
+                n_results=top_k,
+                where=None
+            )
 
         retrieved = []
         if results and results["ids"] and results["ids"][0]:
             for i in range(len(results["ids"][0])):
                 metadata = results["metadatas"][0][i] if results["metadatas"] else {}
+                src_file = metadata.get("source_file", "")
 
+                if filter_file and src_file != filter_file:
+                    continue
                 if filter_ext:
-                    src_file = metadata.get("source_file", "")
-                    if not src_file.lower().endswith(filter_ext.lower()):
+                    ext_norm = "." + filter_ext.lower().lstrip(".")
+                    if not src_file.lower().endswith(ext_norm):
                         continue
+                ts = metadata.get("updated_at", 0)
+                if updated_after and ts and float(ts) < float(updated_after):
+                    continue
+                if updated_before and ts and float(ts) > float(updated_before):
+                    continue
 
                 page = metadata.get("page")
                 if page == -1:
                     page = None
+                vec_score = results["distances"][0][i] if results["distances"] else 0.0
                 retrieved.append(RetrievedChunk(
                     content=results["documents"][0][i],
-                    source_file=metadata.get("source_file", "unknown"),
+                    source_file=src_file,
                     page=page,
-                    score=results["distances"][0][i] if results["distances"] else 0.0,
+                    score=vec_score,
+                    vector_score=vec_score,
                     metadata=metadata
                 ))
 
-        logger.info(f"向量检索完成，返回 {len(retrieved)} 条结果")
+        logger.info(f"向量检索完成，返回 {len(retrieved)} 条结果 (where={where})")
         return retrieved
 
     def delete_by_file(self, filename: str):
@@ -344,9 +457,20 @@ class VectorStore:
         )
 
     def list_files_with_info(self, upload_dir: Optional[Path] = None) -> List[FileInfo]:
-        filenames = self.list_files()
+        all_names = set(self.list_files())
+
+        for fn in self._state.get("files", {}).keys():
+            all_names.add(fn)
+
+        if upload_dir is not None and upload_dir.exists():
+            from docurag.ingestion.loader import DocumentLoader
+            supported = DocumentLoader.SUPPORTED_EXTENSIONS
+            for f in upload_dir.iterdir():
+                if f.is_file() and f.suffix.lower() in supported:
+                    all_names.add(f.name)
+
         result = []
-        for fn in filenames:
+        for fn in sorted(all_names):
             info = self.get_file_info(fn, upload_dir)
             if info:
                 result.append(info)

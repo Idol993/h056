@@ -2,6 +2,7 @@ from .loader import DocumentLoader, DocumentChunk
 from .splitter import TextSplitter
 from .embedder import Embedder
 from .pipeline import (
+    DoctorFixReport,
     FileIngestDetail,
     IngestionPipeline,
     IngestResult,
@@ -14,6 +15,7 @@ __all__ = [
     "DocumentChunk",
     "TextSplitter",
     "Embedder",
+    "DoctorFixReport",
     "FileIngestDetail",
     "IngestionPipeline",
     "IngestResult",

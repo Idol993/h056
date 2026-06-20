@@ -1,3 +1,4 @@
+import json
 import logging
 import sys
 from datetime import datetime
@@ -180,6 +181,8 @@ def ingest(path: Optional[str], clear: bool, force: bool):
 @click.option("--before", "updated_before", default=None, help="只查此时间前更新的文档")
 @click.option("--retrieve-only", is_flag=True, help="仅返回检索到的来源片段，不调用 LLM")
 @click.option("--top-k", default=None, type=int, help="返回前 K 条结果")
+@click.option("--debug", is_flag=True, help="调试模式：显示过滤条件、命中文件、相似度/重排序分数")
+@click.option("--json", "json_output", is_flag=True, help="以 JSON 格式输出完整结果（含调试信息）")
 def query(
     question: str,
     no_stream: bool,
@@ -189,6 +192,8 @@ def query(
     updated_before: Optional[str],
     retrieve_only: bool,
     top_k: Optional[int],
+    debug: bool,
+    json_output: bool,
 ):
     from docurag.generation import LLMClient, PromptBuilder
     from docurag.ingestion import Embedder
@@ -221,36 +226,75 @@ def query(
             print_error("向量库为空，请先运行 'docurag ingest' 摄入文档")
             sys.exit(1)
 
-        click.echo(click.style("正在检索相关文档...", fg="cyan"))
-        retrieved = retriever.retrieve(question, filters=filters)
+        if not json_output:
+            click.echo(click.style("正在检索相关文档...", fg="cyan"))
+        retrieved, debug_info = retriever.retrieve(question, filters=filters, return_debug=True)
+        debug_dict = Retriever.debug_to_dict(debug_info)
 
         if not retrieved:
-            print_answer("未找到相关信息")
+            if json_output:
+                click.echo(json.dumps({
+                    "question": question,
+                    "answer": "未找到相关信息",
+                    "sources": [],
+                    "debug": debug_dict,
+                }, ensure_ascii=False, indent=2))
+            else:
+                print_answer("未找到相关信息")
+                if debug:
+                    click.echo(click.style("\n调试信息:", fg="yellow", bold=True))
+                    click.echo(json.dumps(debug_dict, ensure_ascii=False, indent=2))
             return
 
         sources = Retriever.format_sources(retrieved)
 
-        click.echo(click.style(f"\n命中 {len(retrieved)} 个相关片段:", fg="cyan", bold=True))
-        for i, src in enumerate(sources, 1):
-            print_source(src.get("file", "?"), src.get("page"), src.get("snippet", ""))
+        if json_output:
+            output = {
+                "question": question,
+                "sources": sources,
+                "debug": debug_dict,
+            }
+
+        if not json_output and (debug or not retrieve_only):
+            click.echo(click.style(f"\n命中 {len(retrieved)} 个相关片段:", fg="cyan", bold=True))
+            for i, src in enumerate(sources, 1):
+                print_source(src.get("file", "?"), src.get("page"), src.get("snippet", ""))
+                if debug:
+                    score_info = []
+                    if src.get("vector_score") is not None:
+                        score_info.append(f"vec={src['vector_score']:.4f}")
+                    if src.get("rerank_score") is not None:
+                        score_info.append(f"rerank={src['rerank_score']:.4f}")
+                    if score_info:
+                        click.echo(f"      ({', '.join(score_info)})")
+
+        if debug and not json_output:
+            click.echo(click.style("\n调试信息:", fg="yellow", bold=True))
+            click.echo(json.dumps(debug_dict, ensure_ascii=False, indent=2))
 
         if retrieve_only:
+            if json_output:
+                output["answer"] = ""
+                click.echo(json.dumps(output, ensure_ascii=False, indent=2))
             return
 
         prompt_builder = PromptBuilder()
         llm_client = LLMClient()
         prompt = prompt_builder.build(question, retrieved)
 
-        click.echo(click.style("\n答案:", fg="cyan", bold=True))
+        if not json_output:
+            click.echo(click.style("\n答案:", fg="cyan", bold=True))
 
         if no_stream:
             try:
-                answer = llm_client.generate(prompt, stream=False)
-                print_answer(answer or "未找到相关信息")
+                answer = llm_client.generate(prompt, stream=False) or "未找到相关信息"
+                if not json_output:
+                    print_answer(answer)
             except Exception as e:
                 logging.exception("LLM 调用失败")
-                print_error(f"生成答案失败: {e}")
                 answer = ""
+                if not json_output:
+                    print_error(f"生成答案失败: {e}")
         else:
             answer = ""
             try:
@@ -258,32 +302,42 @@ def query(
                 from rich.live import Live
                 from rich.text import Text
 
-                console = Console()
-                accumulated = ""
-                text = Text(accumulated)
+                if json_output:
+                    answer = llm_client.generate(prompt, stream=False) or "未找到相关信息"
+                else:
+                    console = Console()
+                    accumulated = ""
+                    text = Text(accumulated)
 
-                with Live(text, console=console, refresh_per_second=10) as live:
-                    try:
-                        stream = llm_client.generate(prompt, stream=True)
-                        if stream:
-                            for token in stream:
-                                accumulated += token
-                                text = Text(accumulated)
-                                live.update(text)
-                    except Exception as inner_e:
-                        accumulated += f"\n[生成中断: {inner_e}]"
-                        text = Text(accumulated)
-                        live.update(text)
-                answer = accumulated
-                click.echo()
+                    with Live(text, console=console, refresh_per_second=10) as live:
+                        try:
+                            stream = llm_client.generate(prompt, stream=True)
+                            if stream:
+                                for token in stream:
+                                    accumulated += token
+                                    text = Text(accumulated)
+                                    live.update(text)
+                        except Exception as inner_e:
+                            accumulated += f"\n[生成中断: {inner_e}]"
+                            text = Text(accumulated)
+                            live.update(text)
+                    answer = accumulated
+                    click.echo()
             except ImportError:
                 try:
-                    answer = llm_client.generate(prompt, stream=False)
-                    print_answer(answer or "未找到相关信息")
+                    answer = llm_client.generate(prompt, stream=False) or "未找到相关信息"
+                    if not json_output:
+                        print_answer(answer)
                 except Exception as e:
                     logging.exception("LLM 调用失败")
-                    print_error(f"生成答案失败: {e}")
                     answer = ""
+                    if not json_output:
+                        print_error(f"生成答案失败: {e}")
+
+        if json_output:
+            output["answer"] = answer
+            click.echo(json.dumps(output, ensure_ascii=False, indent=2))
+            return
 
         click.echo()
         try:
@@ -324,15 +378,16 @@ def serve(host: str, port: int, no_watch: bool, no_auto_ingest: bool):
     set_auto_ingest_on_start(not no_auto_ingest)
 
     click.echo(f"启动 DocuRAG API 服务: http://{host}:{port}")
-    click.echo(f"  POST /query              - 问答接口")
-    click.echo(f"  GET  /ingest             - 触发文档同步")
-    click.echo(f"  GET  /status             - 查看状态")
-    click.echo(f"  GET  /doctor             - 审计诊断")
-    click.echo(f"  POST /doctor/fix         - 一键修复")
-    click.echo(f"  GET  /docs               - 文件列表")
-    click.echo(f"  GET  /docs/{{name}}       - 文件详情")
-    click.echo(f"  POST /docs/{{name}}/ingest - 重新摄入单文件")
-    click.echo(f"  DELETE /docs/{{name}}     - 删除单文件记录")
+    click.echo(f"  POST /query                 - 问答接口 (支持 debug/filter_ext/retrieve_only)")
+    click.echo(f"  GET  /ingest                - 触发文档同步")
+    click.echo(f"  GET  /status                - 查看状态")
+    click.echo(f"  GET  /doctor                - 审计诊断")
+    click.echo(f"  POST /doctor/fix            - 一键修复 (返回详细分类报告)")
+    click.echo(f"  GET  /docs                  - 文件列表 (含失败文件)")
+    click.echo(f"  GET  /docs/{{name}}          - 文件详情")
+    click.echo(f"  GET  /docs/{{name}}/history  - 文件摄入历史")
+    click.echo(f"  POST /docs/{{name}}/ingest   - 重新摄入单文件")
+    click.echo(f"  DELETE /docs/{{name}}        - 删除单文件记录")
     if not no_watch:
         click.echo(f"  自动监听: {UPLOAD_DIR} (新增/修改/删除/重命名自动同步)")
     if not no_auto_ingest and not no_watch:
@@ -363,6 +418,8 @@ def list_files(short: bool):
             click.echo("  (空库)")
             return
 
+        source_map = {"manual": "手动", "watcher": "监听器", "api": "Web API", "doctor": "诊断修复", "": "-"}
+
         for f in files:
             status = "在库中" if f.exists_in_uploads else "[已删除]"
             status_color = "green" if f.exists_in_uploads else "red"
@@ -370,6 +427,8 @@ def list_files(short: bool):
             last_status = f.last_ingest_status or "unknown"
             status_map = {"added": "新增", "replaced": "更新", "skipped": "跳过", "failed": "失败", "": "-"}
             status_label = status_map.get(last_status, last_status)
+            state = pipeline.vector_store.get_file_ingest_state(f.filename) or {}
+            last_source = source_map.get(state.get("source", ""), state.get("source", "-"))
             try:
                 status_str = click.style(status, fg=status_color)
             except Exception:
@@ -378,7 +437,7 @@ def list_files(short: bool):
             click.echo(f"  {f.filename}")
             click.echo(
                 f"    片段: {f.chunk_count}  |  更新: {_format_time(f.updated_at)}  |  {status_str}"
-                f"  |  上次: {status_label}"
+                f"  |  上次: {status_label}  |  来源: {last_source}"
             )
             if f.last_ingest_error:
                 click.echo(f"    错误: {f.last_ingest_error}")
@@ -523,11 +582,65 @@ def doctor(fix: bool, yes: bool):
         def _progress(msg: str):
             click.echo(f"  {msg}")
 
-        result = pipeline.fix_doctor_issues(report, progress_cb=_progress)
-        print_success(f"\n{result.message}")
+        fix = pipeline.fix_doctor_issues(report, progress_cb=_progress)
+        print_success(f"\n{fix.message}")
+
+        if fix.cleaned_orphans:
+            click.echo(f"  已清理孤儿 ({len(fix.cleaned_orphans)}): {', '.join(fix.cleaned_orphans)}")
+        if fix.added_missing:
+            click.echo(f"  已补录缺失 ({len(fix.added_missing)}): {', '.join(fix.added_missing)}")
+        if fix.fixed_hash_mismatch:
+            click.echo(f"  已修复哈希不一致 ({len(fix.fixed_hash_mismatch)}): {', '.join(fix.fixed_hash_mismatch)}")
+        if fix.rebuilt_stale:
+            click.echo(f"  已重建过期 ({len(fix.rebuilt_stale)}): {', '.join(fix.rebuilt_stale)}")
+
+        all_failed = fix.rebuilt_stale_failed + fix.added_missing_failed + fix.fixed_hash_mismatch_failed
+        if all_failed:
+            print_warn(f"  仍失败 ({len(all_failed)}): {', '.join(all_failed)}")
+            for d in fix.details:
+                if d.status == "failed" and d.error:
+                    click.echo(f"    - {d.filename}: {d.error}")
 
     except Exception as e:
         logging.exception("诊断失败")
+        print_error(str(e))
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("filename")
+@click.option("--limit", "-n", default=10, type=int, help="显示最近 N 条记录 (默认 10)")
+def history(filename: str, limit: int):
+    """查看文件的摄入历史记录"""
+    from docurag.ingestion import IngestionPipeline
+
+    try:
+        pipeline = IngestionPipeline()
+        entries = pipeline.get_ingest_history(filename, limit=limit)
+        if not entries:
+            print_warn(f"文件 {filename} 暂无摄入历史记录")
+            return
+
+        status_map = {"added": "新增", "replaced": "更新", "skipped": "跳过", "failed": "失败"}
+        source_map = {"manual": "手动", "watcher": "监听器", "api": "Web API", "doctor": "诊断修复"}
+
+        click.echo(f"文件 {filename} 的最近 {len(entries)} 次摄入记录:")
+        for i, e in enumerate(entries, 1):
+            status_label = status_map.get(e.status, e.status)
+            source_label = source_map.get(e.source, e.source)
+            ts_str = _format_time(e.timestamp)
+            delta_str = f"{e.chunk_delta:+d}" if e.chunk_delta != 0 else "0"
+            line = f"  #{i} [{ts_str}] {status_label} | 来源: {source_label} | 片段: {e.chunk_count} (Δ {delta_str})"
+            if e.status == "failed":
+                print_warn(line)
+                if e.error:
+                    click.echo(f"       错误: {e.error}")
+            else:
+                click.echo(line)
+                if e.prev_file_hash and e.file_hash and e.prev_file_hash != e.file_hash:
+                    click.echo(f"       哈希: {e.prev_file_hash[:12]} → {e.file_hash[:12]}")
+    except Exception as e:
+        logging.exception("获取历史失败")
         print_error(str(e))
         sys.exit(1)
 

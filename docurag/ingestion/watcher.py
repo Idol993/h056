@@ -126,6 +126,7 @@ class DirectoryWatcher:
                     self.watch_dir,
                     clear_first=False,
                     force=False,
+                    source="watcher",
                 )
                 logger.info(f"启动同步完成: {result.message}")
             except Exception as e:
@@ -205,7 +206,7 @@ class DirectoryWatcher:
             return
         logger.info(f"自动摄入: {path.name}")
         try:
-            result = self.pipeline.ingest_file(path, force=False)
+            result = self.pipeline.ingest_file(path, force=False, source="watcher")
             if result.success:
                 logger.info(f"自动摄入完成: {result.message}")
             else:

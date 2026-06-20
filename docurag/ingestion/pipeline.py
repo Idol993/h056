@@ -28,6 +28,22 @@ class FileIngestDetail:
     old_hash: str = ""
     new_hash: str = ""
     error: str = ""
+    source: str = "manual"
+
+
+@dataclass
+class DoctorFixReport:
+    cleaned_orphans: List[str] = field(default_factory=list)
+    rebuilt_stale: List[str] = field(default_factory=list)
+    rebuilt_stale_failed: List[str] = field(default_factory=list)
+    added_missing: List[str] = field(default_factory=list)
+    added_missing_failed: List[str] = field(default_factory=list)
+    fixed_hash_mismatch: List[str] = field(default_factory=list)
+    fixed_hash_mismatch_failed: List[str] = field(default_factory=list)
+    total_chunks_after: int = 0
+    details: List[FileIngestDetail] = field(default_factory=list)
+    message: str = ""
+    success: bool = True
 
 
 @dataclass
@@ -86,6 +102,7 @@ class IngestionPipeline:
         clear_first: bool = False,
         force: bool = False,
         progress_cb: ProgressCallback = None,
+        source: str = "manual",
     ) -> IngestResult:
         directory = Path(directory)
         if not directory.is_dir():
@@ -144,7 +161,7 @@ class IngestionPipeline:
         total_skipped = 0
 
         for file_path in files_to_process:
-            result = self.ingest_file(file_path, force=force, progress_cb=progress_cb)
+            result = self.ingest_file(file_path, force=force, progress_cb=progress_cb, source=source)
             if result.success:
                 if result.details:
                     d = result.details[0]
@@ -201,15 +218,16 @@ class IngestionPipeline:
         file_path: str | Path,
         force: bool = False,
         progress_cb: ProgressCallback = None,
+        source: str = "manual",
     ) -> IngestResult:
         file_path = Path(file_path)
-        detail = FileIngestDetail(filename=file_path.name)
+        detail = FileIngestDetail(filename=file_path.name, source=source)
 
         if not file_path.exists() or not file_path.is_file():
             detail.status = "failed"
             detail.error = f"文件不存在: {file_path}"
             self.vector_store.set_file_ingest_state(
-                file_path.name, "failed", error=detail.error,
+                file_path.name, "failed", error=detail.error, source=source,
             )
             return IngestResult(
                 success=False,
@@ -223,7 +241,7 @@ class IngestionPipeline:
             detail.status = "failed"
             detail.error = f"不支持的格式: {ext}"
             self.vector_store.set_file_ingest_state(
-                file_path.name, "failed", error=detail.error,
+                file_path.name, "failed", error=detail.error, source=source,
             )
             return IngestResult(
                 success=False,
@@ -253,6 +271,7 @@ class IngestionPipeline:
                     file_hash=current_hash,
                     prev_chunk_count=prev_count,
                     prev_file_hash=stored_hash or "",
+                    source=source,
                 )
                 return IngestResult(
                     success=True,
@@ -272,6 +291,7 @@ class IngestionPipeline:
                 self.vector_store.set_file_ingest_state(
                     file_path.name, "failed", error=detail.error,
                     prev_chunk_count=prev_count, prev_file_hash=stored_hash or "",
+                    source=source,
                 )
                 return IngestResult(
                     success=False,
@@ -290,6 +310,7 @@ class IngestionPipeline:
                 self.vector_store.set_file_ingest_state(
                     file_path.name, "failed", error=detail.error,
                     prev_chunk_count=prev_count, prev_file_hash=stored_hash or "",
+                    source=source,
                 )
                 return IngestResult(
                     success=False,
@@ -330,6 +351,7 @@ class IngestionPipeline:
                 file_hash=current_hash,
                 prev_chunk_count=prev_count,
                 prev_file_hash=stored_hash or "",
+                source=source,
             )
 
             return IngestResult(
@@ -351,7 +373,7 @@ class IngestionPipeline:
             detail.status = "failed"
             detail.error = str(e)
             self.vector_store.set_file_ingest_state(
-                file_path.name, "failed", error=detail.error,
+                file_path.name, "failed", error=detail.error, source=source,
             )
             return IngestResult(
                 success=False,
@@ -391,6 +413,9 @@ class IngestionPipeline:
 
     def get_file_info(self, filename: str, upload_dir: Optional[Path] = None) -> Optional[FileInfo]:
         return self.vector_store.get_file_info(filename, upload_dir)
+
+    def get_ingest_history(self, filename: str, limit: int = 10) -> list:
+        return self.vector_store.get_ingest_history(filename, limit)
 
     def doctor(self, upload_dir: Path = UPLOAD_DIR, watcher_running: bool = False) -> DoctorReport:
         supported = DocumentLoader.SUPPORTED_EXTENSIONS
@@ -443,38 +468,59 @@ class IngestionPipeline:
 
         return report
 
-    def fix_doctor_issues(self, report: DoctorReport, progress_cb: ProgressCallback = None) -> IngestResult:
+    def fix_doctor_issues(self, report: DoctorReport, progress_cb: ProgressCallback = None) -> DoctorFixReport:
         from docurag.config import UPLOAD_DIR
         upload_dir = Path(report.upload_dir) if report.upload_dir else UPLOAD_DIR
+
+        fix = DoctorFixReport()
 
         for fn in report.orphan_files:
             if progress_cb:
                 progress_cb(f"清理孤儿记录: {fn}")
-            self.remove_file(fn)
+            if self.remove_file(fn):
+                fix.cleaned_orphans.append(fn)
 
-        result = IngestResult(success=True)
+        stale_set = set(report.stale_files)
+        missing_set = set(report.missing_files)
+        hash_set = set(report.hash_mismatch)
+
         for fn in report.missing_files + report.hash_mismatch + report.stale_files:
             fp = upload_dir / fn
-            if fp.exists():
-                r = self.ingest_file(fp, force=True, progress_cb=progress_cb)
-                if r.success:
-                    if r.updated_files:
-                        result.updated_files.extend(r.updated_files)
-                    if r.processed_files:
-                        result.processed_files.extend(r.processed_files)
-                    if r.details:
-                        result.details.extend(r.details)
-                    result.total_added += r.total_added
-                    result.total_replaced += r.total_replaced
-                else:
-                    result.failed_files.extend(r.failed_files)
-                    if r.details:
-                        result.details.extend(r.details)
+            if not fp.exists():
+                continue
+            r = self.ingest_file(fp, force=True, progress_cb=progress_cb, source="doctor")
+            if r.details:
+                fix.details.extend(r.details)
+            if r.success:
+                if fn in stale_set:
+                    fix.rebuilt_stale.append(fn)
+                elif fn in missing_set:
+                    fix.added_missing.append(fn)
+                elif fn in hash_set:
+                    fix.fixed_hash_mismatch.append(fn)
+            else:
+                if fn in stale_set:
+                    fix.rebuilt_stale_failed.append(fn)
+                elif fn in missing_set:
+                    fix.added_missing_failed.append(fn)
+                elif fn in hash_set:
+                    fix.fixed_hash_mismatch_failed.append(fn)
 
-        result.total_chunks = self.vector_store.count()
-        result.message = (
-            f"修复完成: 新增 {len(result.processed_files)} 个，更新 {len(result.updated_files)} 个，"
-            f"失败 {len(result.failed_files)} 个，清理孤儿 {len(report.orphan_files)} 个，"
-            f"库中共 {result.total_chunks} 条记录"
-        )
-        return result
+        fix.total_chunks_after = self.vector_store.count()
+
+        parts = []
+        if fix.cleaned_orphans:
+            parts.append(f"清理孤儿 {len(fix.cleaned_orphans)} 个")
+        if fix.rebuilt_stale:
+            parts.append(f"重建过期 {len(fix.rebuilt_stale)} 个")
+        if fix.added_missing:
+            parts.append(f"补录缺失 {len(fix.added_missing)} 个")
+        if fix.fixed_hash_mismatch:
+            parts.append(f"修复哈希不一致 {len(fix.fixed_hash_mismatch)} 个")
+        total_fail = len(fix.rebuilt_stale_failed) + len(fix.added_missing_failed) + len(fix.fixed_hash_mismatch_failed)
+        if total_fail:
+            parts.append(f"仍失败 {total_fail} 个")
+        parts.append(f"库中共 {fix.total_chunks_after} 条记录")
+        fix.message = "修复完成: " + "，".join(parts)
+        fix.success = total_fail == 0
+        return fix
