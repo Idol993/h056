@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -7,6 +7,7 @@ from docurag.config import UPLOAD_DIR
 from docurag.ingestion import DocumentLoader, Embedder, TextSplitter
 from docurag.ingestion.loader import DocumentChunk
 from docurag.retrieval import VectorStore
+from docurag.retrieval.vector_store import FileInfo, compute_file_hash
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +17,9 @@ class IngestResult:
     success: bool
     processed_files: List[str]
     skipped_files: List[str]
-    total_chunks: int
-    message: str
+    removed_files: List[str] = field(default_factory=list)
+    total_chunks: int = 0
+    message: str = ""
 
 
 ProgressCallback = Optional[Callable[[str], None]]
@@ -54,7 +56,7 @@ class IngestionPipeline:
             self._vector_store = VectorStore()
         return self._vector_store
 
-    def ingest_directory(
+    def sync_directory(
         self,
         directory: str | Path = UPLOAD_DIR,
         clear_first: bool = False,
@@ -76,29 +78,43 @@ class IngestionPipeline:
                 progress_cb("已清空向量库")
 
         supported = DocumentLoader.SUPPORTED_EXTENSIONS
-        files_to_process = [
-            f for f in sorted(directory.iterdir())
+        actual_files = {
+            f.name for f in directory.iterdir()
             if f.is_file() and f.suffix.lower() in supported
-        ]
+        }
+        db_files = set(self.vector_store.list_files())
 
-        if not files_to_process:
+        removed: List[str] = []
+        missing_files = db_files - actual_files
+        if missing_files:
+            for fn in sorted(missing_files):
+                if progress_cb:
+                    progress_cb(f"清理已删除文件: {fn}")
+                if self.vector_store.delete_by_file(fn) is not None:
+                    pass
+                removed.append(fn)
+            if progress_cb:
+                progress_cb(f"已清理 {len(removed)} 个已删除文件的记录")
+
+        files_to_process = sorted([directory / fn for fn in actual_files])
+
+        if not files_to_process and not removed:
             return IngestResult(
                 success=True,
                 processed_files=[],
                 skipped_files=[],
+                removed_files=removed,
                 total_chunks=self.vector_store.count(),
                 message=f"目录 {directory} 中没有可摄入的文档"
             )
 
         processed: List[str] = []
         skipped: List[str] = []
-        grand_total = 0
 
         for file_path in files_to_process:
             result = self.ingest_file(file_path, progress_cb=progress_cb)
             if result.success:
                 processed.append(file_path.name)
-                grand_total += result.total_chunks
             else:
                 skipped.append(file_path.name)
                 logger.warning(f"跳过文件 {file_path.name}: {result.message}")
@@ -107,13 +123,26 @@ class IngestionPipeline:
             success=True,
             processed_files=processed,
             skipped_files=skipped,
+            removed_files=removed,
             total_chunks=self.vector_store.count(),
-            message=f"处理完成: 成功 {len(processed)} 个文件，跳过 {len(skipped)} 个，库中共 {self.vector_store.count()} 条记录"
+            message=(
+                f"同步完成: 新增/更新 {len(processed)} 个，跳过 {len(skipped)} 个，"
+                f"清理 {len(removed)} 个，库中共 {self.vector_store.count()} 条记录"
+            )
         )
+
+    def ingest_directory(
+        self,
+        directory: str | Path = UPLOAD_DIR,
+        clear_first: bool = False,
+        progress_cb: ProgressCallback = None
+    ) -> IngestResult:
+        return self.sync_directory(directory, clear_first, progress_cb)
 
     def ingest_file(
         self,
         file_path: str | Path,
+        force: bool = False,
         progress_cb: ProgressCallback = None
     ) -> IngestResult:
         file_path = Path(file_path)
@@ -137,6 +166,20 @@ class IngestionPipeline:
             )
 
         try:
+            current_hash = compute_file_hash(file_path)
+            stored_hash = self.vector_store.get_file_hash(file_path.name)
+
+            if not force and stored_hash and current_hash == stored_hash:
+                logger.info(f"文件未变化，跳过: {file_path.name}")
+                info = self.vector_store.get_file_info(file_path.name)
+                return IngestResult(
+                    success=True,
+                    processed_files=[file_path.name],
+                    skipped_files=[],
+                    total_chunks=info.chunk_count if info else 0,
+                    message=f"文件未变化，跳过: {file_path.name}"
+                )
+
             if progress_cb:
                 progress_cb(f"加载文件: {file_path.name}")
 
@@ -171,7 +214,7 @@ class IngestionPipeline:
             if progress_cb:
                 progress_cb(f"去重入库: {file_path.name}")
 
-            self._upsert_file(file_path.name, split_chunks, embeddings)
+            self._upsert_file(file_path.name, split_chunks, embeddings, file_hash=current_hash)
 
             return IngestResult(
                 success=True,
@@ -195,11 +238,12 @@ class IngestionPipeline:
         self,
         filename: str,
         chunks: List[DocumentChunk],
-        embeddings: list
+        embeddings: list,
+        file_hash: Optional[str] = None
     ):
         self.vector_store.delete_by_file(filename)
-        self.vector_store.add_documents(chunks, embeddings)
-        logger.info(f"文件 {filename} 已更新入库 ({len(chunks)} 片段)")
+        self.vector_store.add_documents(chunks, embeddings, file_hash=file_hash)
+        logger.info(f"文件 {filename} 已更新入库 ({len(chunks)} 片段, hash={file_hash[:16] if file_hash else 'none'})")
 
     def remove_file(self, filename: str) -> bool:
         try:
@@ -209,3 +253,9 @@ class IngestionPipeline:
         except Exception as e:
             logger.error(f"移除文件失败 {filename}: {e}")
             return False
+
+    def list_files(self, upload_dir: Optional[Path] = None) -> List[FileInfo]:
+        return self.vector_store.list_files_with_info(upload_dir)
+
+    def get_file_info(self, filename: str, upload_dir: Optional[Path] = None) -> Optional[FileInfo]:
+        return self.vector_store.get_file_info(filename, upload_dir)

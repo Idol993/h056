@@ -1,8 +1,10 @@
+import hashlib
 import logging
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import chromadb
 from chromadb.config import Settings
@@ -21,6 +23,30 @@ class RetrievedChunk:
     page: Optional[int]
     score: float
     metadata: dict
+
+
+@dataclass
+class FileInfo:
+    filename: str
+    chunk_count: int
+    file_hash: str = ""
+    updated_at: float = 0.0
+    exists_in_uploads: bool = False
+    metadata: dict = field(default_factory=dict)
+
+
+def compute_file_hash(file_path: str | Path) -> str:
+    path = Path(file_path)
+    if not path.exists():
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class VectorStore:
@@ -52,7 +78,13 @@ class VectorStore:
         collection = self._get_collection()
         return collection.count()
 
-    def add_documents(self, chunks: List[DocumentChunk], embeddings: List[np.ndarray]):
+    def add_documents(
+        self,
+        chunks: List[DocumentChunk],
+        embeddings: List[np.ndarray],
+        file_hash: Optional[str] = None,
+        updated_at: Optional[float] = None
+    ):
         if not chunks or not embeddings:
             return
 
@@ -60,6 +92,7 @@ class VectorStore:
             raise ValueError(f"chunks 数量 ({len(chunks)}) 与 embeddings 数量 ({len(embeddings)}) 不匹配")
 
         collection = self._get_collection()
+        ts = updated_at if updated_at is not None else time.time()
 
         ids = []
         documents = []
@@ -71,7 +104,10 @@ class VectorStore:
             metadata = {
                 "source_file": chunk.source_file,
                 "page": chunk.page if chunk.page is not None else -1,
+                "updated_at": float(ts),
             }
+            if file_hash:
+                metadata["file_hash"] = file_hash
             if chunk.metadata:
                 for k, v in chunk.metadata.items():
                     if k not in metadata and isinstance(v, (str, int, float, bool)):
@@ -82,7 +118,7 @@ class VectorStore:
             metadatas.append(metadata)
             vectors.append(embedding.tolist() if isinstance(embedding, np.ndarray) else embedding)
 
-        logger.info(f"向向量库添加 {len(ids)} 条文档")
+        logger.info(f"向向量库添加 {len(ids)} 条文档 (file_hash={file_hash[:16] if file_hash else 'none'})")
         collection.add(
             ids=ids,
             documents=documents,
@@ -132,6 +168,69 @@ class VectorStore:
             collection.delete(ids=results["ids"])
             logger.info(f"已删除文件 {filename} 的 {len(results['ids'])} 条向量记录")
 
+    def get_file_hash(self, filename: str) -> Optional[str]:
+        collection = self._get_collection()
+        results = collection.get(
+            where={"source_file": filename},
+            limit=1
+        )
+        if results and results["metadatas"]:
+            meta = results["metadatas"][0]
+            return meta.get("file_hash")
+        return None
+
+    def get_file_updated_at(self, filename: str) -> Optional[float]:
+        collection = self._get_collection()
+        results = collection.get(
+            where={"source_file": filename},
+            limit=1
+        )
+        if results and results["metadatas"]:
+            meta = results["metadatas"][0]
+            ts = meta.get("updated_at")
+            return float(ts) if ts is not None else None
+        return None
+
+    def get_file_info(self, filename: str, upload_dir: Optional[Path] = None) -> Optional[FileInfo]:
+        collection = self._get_collection()
+        results = collection.get(where={"source_file": filename})
+        if not results or not results["ids"]:
+            return None
+
+        chunk_count = len(results["ids"])
+        file_hash = ""
+        updated_at = 0.0
+        meta_sample = {}
+
+        if results["metadatas"]:
+            meta = results["metadatas"][0]
+            file_hash = meta.get("file_hash", "")
+            ts = meta.get("updated_at")
+            updated_at = float(ts) if ts is not None else 0.0
+            meta_sample = {k: v for k, v in meta.items() if k not in ("source_file", "page", "file_hash", "updated_at")}
+
+        exists_in_uploads = False
+        if upload_dir:
+            exists_in_uploads = (upload_dir / filename).exists()
+
+        return FileInfo(
+            filename=filename,
+            chunk_count=chunk_count,
+            file_hash=file_hash,
+            updated_at=updated_at,
+            exists_in_uploads=exists_in_uploads,
+            metadata=meta_sample
+        )
+
+    def list_files_with_info(self, upload_dir: Optional[Path] = None) -> List[FileInfo]:
+        filenames = self.list_files()
+        result = []
+        for fn in filenames:
+            info = self.get_file_info(fn, upload_dir)
+            if info:
+                result.append(info)
+        return result
+
     def list_files(self) -> List[str]:
         collection = self._get_collection()
         results = collection.get()
@@ -145,6 +244,9 @@ class VectorStore:
 
     def clear(self):
         client = self._get_client()
-        client.delete_collection(self.collection_name)
+        try:
+            client.delete_collection(self.collection_name)
+        except Exception:
+            pass
         self._collection = None
         logger.info("向量库已清空")

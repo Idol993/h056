@@ -2,11 +2,12 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Set
+from typing import Optional
 
 from docurag.config import UPLOAD_DIR
 from docurag.ingestion.loader import DocumentLoader
 from docurag.ingestion.pipeline import IngestionPipeline
+from docurag.retrieval.vector_store import compute_file_hash
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ class DirectoryWatcher:
         self,
         watch_dir: str | Path = UPLOAD_DIR,
         pipeline: Optional[IngestionPipeline] = None,
-        debounce_seconds: float = 1.5
+        debounce_seconds: float = 2.0
     ):
         self.watch_dir = Path(watch_dir)
         self.pipeline = pipeline or IngestionPipeline()
@@ -25,7 +26,7 @@ class DirectoryWatcher:
         self._observer = None
         self._running = False
         self._pending_files: dict[str, float] = {}
-        self._processed_sizes: dict[str, int] = {}
+        self._processed_hashes: dict[str, str] = {}
         self._lock = threading.Lock()
         self._debounce_thread: Optional[threading.Thread] = None
 
@@ -35,6 +36,8 @@ class DirectoryWatcher:
 
         self.watch_dir.mkdir(parents=True, exist_ok=True)
         self._running = True
+
+        self._init_existing_hashes()
 
         try:
             from watchdog.events import FileSystemEventHandler, FileMovedEvent
@@ -57,6 +60,9 @@ class DirectoryWatcher:
                     if event.is_directory:
                         return
                     if isinstance(event, FileMovedEvent):
+                        src_path = Path(event.src_path)
+                        if src_path.suffix.lower() in watcher._supported:
+                            watcher._on_renamed(event.src_path, event.dest_path)
                         watcher._enqueue(event.dest_path)
 
                 def on_deleted(self, event):
@@ -89,19 +95,30 @@ class DirectoryWatcher:
             self._observer = None
         logger.info("目录监听器已停止")
 
+    def _init_existing_hashes(self):
+        self.watch_dir.mkdir(parents=True, exist_ok=True)
+        for f in sorted(self.watch_dir.iterdir()):
+            if f.is_file() and f.suffix.lower() in self._supported:
+                try:
+                    h = compute_file_hash(f)
+                    if h:
+                        self._processed_hashes[str(f)] = h
+                except Exception:
+                    pass
+
     def _scan_existing(self):
         self.watch_dir.mkdir(parents=True, exist_ok=True)
         for f in sorted(self.watch_dir.iterdir()):
             if f.is_file() and f.suffix.lower() in self._supported:
-                self._enqueue(str(f))
+                self._enqueue(str(f), check_hash=False)
 
-    def _enqueue(self, file_path: str):
+    def _enqueue(self, file_path: str, check_hash: bool = True):
         path = Path(file_path)
         if path.suffix.lower() not in self._supported:
             return
         with self._lock:
             self._pending_files[str(path)] = time.time()
-        logger.debug(f"文件变更已排队: {path.name}")
+        logger.debug(f"文件变更已排队: {path.name} (check_hash={check_hash})")
 
     def _on_deleted(self, file_path: str):
         path = Path(file_path)
@@ -109,9 +126,21 @@ class DirectoryWatcher:
             return
         try:
             self.pipeline.remove_file(path.name)
-            self._processed_sizes.pop(str(path), None)
+            with self._lock:
+                self._processed_hashes.pop(str(path), None)
         except Exception as e:
             logger.error(f"处理删除事件失败 {path.name}: {e}")
+
+    def _on_renamed(self, src_path: str, dest_path: str):
+        src = Path(src_path)
+        dest = Path(dest_path)
+        try:
+            self.pipeline.remove_file(src.name)
+            with self._lock:
+                self._processed_hashes.pop(str(src), None)
+            logger.info(f"检测到重命名: {src.name} -> {dest.name}，已移除旧记录")
+        except Exception as e:
+            logger.error(f"处理重命名事件失败: {e}")
 
     def _debounce_loop(self):
         while self._running:
@@ -124,14 +153,25 @@ class DirectoryWatcher:
                     for fp, ts in list(self._pending_files.items()):
                         if now - ts >= self.debounce_seconds:
                             try:
-                                size = Path(fp).stat().st_size
+                                p = Path(fp)
+                                if not p.exists() or p.stat().st_size == 0:
+                                    self._pending_files.pop(fp, None)
+                                    continue
+
+                                current_hash = compute_file_hash(p)
+                                prev_hash = self._processed_hashes.get(fp)
+
+                                if current_hash != prev_hash:
+                                    ready.append(fp)
+                                    self._processed_hashes[fp] = current_hash
+                                else:
+                                    logger.debug(f"文件内容未变化，跳过: {p.name}")
+
                             except FileNotFoundError:
-                                self._pending_files.pop(fp, None)
-                                continue
-                            prev_size = self._processed_sizes.get(fp)
-                            if size > 0 and size != prev_size:
-                                ready.append(fp)
-                                self._processed_sizes[fp] = size
+                                pass
+                            except Exception as e:
+                                logger.warning(f"检查文件哈希失败 {fp}: {e}")
+
                             self._pending_files.pop(fp, None)
 
                 for fp in ready:
@@ -146,7 +186,7 @@ class DirectoryWatcher:
             return
         logger.info(f"自动摄入: {path.name}")
         try:
-            result = self.pipeline.ingest_file(path)
+            result = self.pipeline.ingest_file(path, force=False)
             if result.success:
                 logger.info(f"自动摄入完成: {result.message}")
             else:

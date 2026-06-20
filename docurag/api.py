@@ -1,11 +1,12 @@
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from docurag.config import UPLOAD_DIR
 
@@ -59,7 +60,7 @@ async def lifespan(app: FastAPI):
     _stop_watcher()
 
 
-app = FastAPI(title="DocuRAG API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="DocuRAG API", version="0.2.0", lifespan=lifespan)
 
 
 class QueryRequest(BaseModel):
@@ -79,6 +80,16 @@ class IngestResponse(BaseModel):
     total_documents: int
     processed_files: list[str] = []
     skipped_files: list[str] = []
+    removed_files: list[str] = []
+
+
+class FileInfoResponse(BaseModel):
+    filename: str
+    chunk_count: int
+    file_hash: str = ""
+    updated_at: float = 0.0
+    updated_at_str: str = ""
+    exists_in_uploads: bool = False
 
 
 class StatusResponse(BaseModel):
@@ -86,6 +97,27 @@ class StatusResponse(BaseModel):
     total_documents: int
     files: list[str]
     watching: bool
+    upload_dir: str
+
+
+def _format_time(ts: float) -> str:
+    if not ts:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _file_info_to_response(info) -> FileInfoResponse:
+    return FileInfoResponse(
+        filename=info.filename,
+        chunk_count=info.chunk_count,
+        file_hash=info.file_hash,
+        updated_at=info.updated_at,
+        updated_at_str=_format_time(info.updated_at),
+        exists_in_uploads=info.exists_in_uploads
+    )
 
 
 def _get_retriever():
@@ -106,7 +138,8 @@ def get_status():
             status="ok",
             total_documents=vector_store.count(),
             files=vector_store.list_files(),
-            watching=(_watcher is not None and _watcher._running)
+            watching=(_watcher is not None and _watcher._running),
+            upload_dir=str(UPLOAD_DIR)
         )
     except Exception as e:
         logger.exception(f"获取状态失败: {e}")
@@ -117,15 +150,16 @@ def get_status():
 def ingest_documents():
     try:
         pipeline = _get_pipeline()
-        result = pipeline.ingest_directory(UPLOAD_DIR, clear_first=False)
+        result = pipeline.sync_directory(UPLOAD_DIR, clear_first=False)
 
-        if not result.processed_files and not result.skipped_files:
+        if not result.processed_files and not result.skipped_files and not result.removed_files:
             return IngestResponse(
                 status="warning",
                 message=result.message,
                 total_documents=result.total_chunks,
                 processed_files=[],
-                skipped_files=[]
+                skipped_files=[],
+                removed_files=[]
             )
 
         return IngestResponse(
@@ -133,10 +167,11 @@ def ingest_documents():
             message=result.message,
             total_documents=result.total_chunks,
             processed_files=result.processed_files,
-            skipped_files=result.skipped_files
+            skipped_files=result.skipped_files,
+            removed_files=result.removed_files
         )
     except Exception as e:
-        logger.exception(f"文档摄入失败: {e}")
+        logger.exception(f"文档同步失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -190,4 +225,81 @@ def query(request: QueryRequest):
         raise
     except Exception as e:
         logger.exception(f"查询失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/docs", response_model=list[FileInfoResponse])
+def list_documents():
+    try:
+        pipeline = _get_pipeline()
+        files = pipeline.list_files(upload_dir=UPLOAD_DIR)
+        return [_file_info_to_response(f) for f in files]
+    except Exception as e:
+        logger.exception(f"获取文件列表失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/docs/{filename}", response_model=FileInfoResponse)
+def get_document(filename: str):
+    try:
+        pipeline = _get_pipeline()
+        info = pipeline.get_file_info(filename, upload_dir=UPLOAD_DIR)
+        if not info:
+            raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+        return _file_info_to_response(info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"获取文件详情失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/docs/{filename}/ingest", response_model=IngestResponse)
+def reingest_document(filename: str, force: bool = True):
+    try:
+        pipeline = _get_pipeline()
+        file_path = UPLOAD_DIR / filename
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail=f"文件不存在于 uploads: {filename}")
+
+        result = pipeline.ingest_file(file_path, force=force)
+        if not result.success:
+            raise HTTPException(status_code=500, detail=result.message)
+
+        return IngestResponse(
+            status="success",
+            message=result.message,
+            total_documents=pipeline.vector_store.count(),
+            processed_files=result.processed_files,
+            skipped_files=result.skipped_files,
+            removed_files=[]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"重新摄入失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/docs/{filename}")
+def delete_document(filename: str):
+    try:
+        pipeline = _get_pipeline()
+        info = pipeline.get_file_info(filename)
+        if not info:
+            raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+
+        if not pipeline.remove_file(filename):
+            raise HTTPException(status_code=500, detail=f"删除失败: {filename}")
+
+        return {
+            "status": "success",
+            "message": f"已删除文件: {filename}",
+            "deleted": filename,
+            "total_documents": pipeline.vector_store.count()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"删除文件失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))

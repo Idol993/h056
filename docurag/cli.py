@@ -1,5 +1,6 @@
 import logging
 import sys
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -75,6 +76,15 @@ def print_source(file: str, page: Optional[int], snippet: str):
             click.echo(display)
 
 
+def _format_time(ts: float) -> str:
+    if not ts:
+        return "-"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "-"
+
+
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="启用详细日志")
 @click.pass_context
@@ -88,7 +98,8 @@ def cli(ctx: click.Context, verbose: bool):
 @click.option("--path", "-p", type=click.Path(exists=True), default=None,
               help=f"文件或目录路径，默认: {UPLOAD_DIR}")
 @click.option("--clear", "-c", is_flag=True, help="摄入前清空向量库")
-def ingest(path: Optional[str], clear: bool):
+@click.option("--force", "-f", is_flag=True, help="强制重新处理所有文件（忽略哈希校验）")
+def ingest(path: Optional[str], clear: bool, force: bool):
     from docurag.ingestion import IngestionPipeline
 
     try:
@@ -101,17 +112,19 @@ def ingest(path: Optional[str], clear: bool):
 
         if target_path.is_file():
             click.echo(f"正在摄入文件: {target_path}")
-            result = pipeline.ingest_file(target_path, progress_cb=_progress)
+            result = pipeline.ingest_file(target_path, force=force, progress_cb=_progress)
             if result.success:
                 print_success(f"{result.message}")
             else:
                 print_error(result.message)
                 sys.exit(1)
         elif target_path.is_dir():
-            click.echo(f"正在摄入目录: {target_path}")
-            result = pipeline.ingest_directory(target_path, clear_first=clear, progress_cb=_progress)
+            click.echo(f"正在同步目录: {target_path}")
+            result = pipeline.sync_directory(target_path, clear_first=clear, progress_cb=_progress)
             if result.success:
                 print_success(result.message)
+                if result.removed_files:
+                    click.echo(f"  已清理: {', '.join(result.removed_files)}")
                 if result.processed_files:
                     click.echo(f"  已处理: {', '.join(result.processed_files)}")
                 if result.skipped_files:
@@ -241,32 +254,120 @@ def serve(host: str, port: int, no_watch: bool):
     set_auto_watch(not no_watch)
 
     click.echo(f"启动 DocuRAG API 服务: http://{host}:{port}")
-    click.echo(f"  POST /query    - 问答接口")
-    click.echo(f"  GET  /ingest   - 触发文档摄入")
-    click.echo(f"  GET  /status   - 查看状态")
+    click.echo(f"  POST /query        - 问答接口")
+    click.echo(f"  GET  /ingest       - 触发文档同步")
+    click.echo(f"  GET  /status       - 查看状态")
+    click.echo(f"  GET  /docs         - 文件列表")
+    click.echo(f"  GET  /docs/{{name}} - 文件详情")
+    click.echo(f"  POST /docs/{{name}}/ingest - 重新摄入单文件")
+    click.echo(f"  DELETE /docs/{{name}} - 删除单文件记录")
     if not no_watch:
-        click.echo(f"  自动监听: {UPLOAD_DIR} (新增/修改文件自动摄入)")
+        click.echo(f"  自动监听: {UPLOAD_DIR} (新增/修改/删除/重命名自动同步)")
 
     uvicorn.run("docurag.api:app", host=host, port=port, reload=False)
 
 
 @cli.command(name="list")
-def list_files():
-    from docurag.retrieval import VectorStore
+@click.option("--short", "-s", is_flag=True, help="简洁显示，仅文件名")
+def list_files(short: bool):
+    from docurag.ingestion import IngestionPipeline
 
     try:
-        vector_store = VectorStore()
-        files = vector_store.list_files()
-        total = vector_store.count()
+        pipeline = IngestionPipeline()
+        files = pipeline.list_files(upload_dir=UPLOAD_DIR)
+        total = pipeline.vector_store.count()
+
+        if short:
+            click.echo(f"共 {total} 条记录，{len(files)} 个文件:")
+            for f in files:
+                status = "✓" if f.exists_in_uploads else "✗"
+                click.echo(f"  [{status}] {f.filename}")
+            return
 
         click.echo(f"向量库共 {total} 条记录，来自 {len(files)} 个文件:")
-        if files:
-            for f in files:
-                click.echo(f"  - {f}")
-        else:
+        if not files:
             click.echo("  (空库)")
+            return
+
+        for f in files:
+            status = "在库中" if f.exists_in_uploads else "[已删除]"
+            status_color = "green" if f.exists_in_uploads else "red"
+            hash_short = f.file_hash[:16] if f.file_hash else "-"
+            try:
+                status_str = click.style(status, fg=status_color)
+            except Exception:
+                status_str = status
+
+            click.echo(f"  {f.filename}")
+            click.echo(f"    片段数: {f.chunk_count}  |  更新: {_format_time(f.updated_at)}  |  {status_str}")
+            click.echo(f"    哈希: {hash_short}")
     except Exception as e:
         logging.exception("获取文件列表失败")
+        print_error(str(e))
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("filename")
+@click.option("--yes", "-y", is_flag=True, help="跳过确认")
+def remove(filename: str, yes: bool):
+    from docurag.ingestion import IngestionPipeline
+
+    try:
+        pipeline = IngestionPipeline()
+        info = pipeline.get_file_info(filename)
+
+        if not info:
+            print_error(f"向量库中没有文件: {filename}")
+            sys.exit(1)
+
+        if not yes:
+            click.echo(f"将从向量库删除: {filename} ({info.chunk_count} 个片段)")
+            confirm = click.prompt("确认删除? (y/N)", default="N", show_default=False)
+            if confirm.lower() not in ("y", "yes"):
+                click.echo("已取消")
+                return
+
+        if pipeline.remove_file(filename):
+            print_success(f"已删除文件: {filename}")
+        else:
+            print_error(f"删除失败: {filename}")
+            sys.exit(1)
+
+    except Exception as e:
+        logging.exception("删除文件失败")
+        print_error(str(e))
+        sys.exit(1)
+
+
+@cli.command(name="sync")
+@click.option("--clear", "-c", is_flag=True, help="同步前清空向量库")
+def sync_cmd(clear: bool):
+    from docurag.ingestion import IngestionPipeline
+
+    try:
+        pipeline = IngestionPipeline()
+
+        def _progress(msg: str):
+            click.echo(f"  {msg}")
+
+        click.echo(f"正在同步 uploads 目录: {UPLOAD_DIR}")
+        result = pipeline.sync_directory(UPLOAD_DIR, clear_first=clear, progress_cb=_progress)
+
+        if result.success:
+            print_success(result.message)
+            if result.removed_files:
+                click.echo(f"  已清理: {', '.join(result.removed_files)}")
+            if result.processed_files:
+                click.echo(f"  已处理: {', '.join(result.processed_files)}")
+            if result.skipped_files:
+                click.echo(f"  已跳过: {', '.join(result.skipped_files)}")
+        else:
+            print_error(result.message)
+            sys.exit(1)
+
+    except Exception as e:
+        logging.exception("同步失败")
         print_error(str(e))
         sys.exit(1)
 
