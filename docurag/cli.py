@@ -33,7 +33,7 @@ def setup_logging(verbose: bool = False):
         LOG_FILE,
         maxBytes=LOG_MAX_BYTES,
         backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8"
+        encoding="utf-8",
     )
     file_handler.setLevel(log_level)
     file_handler.setFormatter(logging.Formatter(log_format))
@@ -50,6 +50,13 @@ def print_error(msg: str):
 def print_success(msg: str):
     try:
         click.echo(click.style(msg, fg="green"))
+    except Exception:
+        click.echo(msg)
+
+
+def print_warn(msg: str):
+    try:
+        click.echo(click.style(msg, fg="yellow"))
     except Exception:
         click.echo(msg)
 
@@ -85,6 +92,18 @@ def _format_time(ts: float) -> str:
         return "-"
 
 
+def _parse_time_str(s: str) -> float:
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except Exception:
+            pass
+    try:
+        return float(s)
+    except Exception:
+        raise click.BadParameter(f"无法解析时间: {s}")
+
+
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="启用详细日志")
 @click.pass_context
@@ -115,20 +134,30 @@ def ingest(path: Optional[str], clear: bool, force: bool):
             result = pipeline.ingest_file(target_path, force=force, progress_cb=_progress)
             if result.success:
                 print_success(f"{result.message}")
+                if result.details:
+                    d = result.details[0]
+                    if d.status == "replaced":
+                        click.echo(f"  片段变化: {d.removed_chunks} -> {d.replaced_chunks} (delta {d.chunk_delta:+d})")
+                    if d.old_hash and d.new_hash and d.old_hash != d.new_hash:
+                        click.echo(f"  哈希变化: {d.old_hash[:16]} -> {d.new_hash[:16]}")
             else:
                 print_error(result.message)
                 sys.exit(1)
         elif target_path.is_dir():
-            click.echo(f"正在同步目录: {target_path}")
-            result = pipeline.sync_directory(target_path, clear_first=clear, progress_cb=_progress)
+            click.echo(f"正在同步目录: {target_path} {'(强制重建)' if force else ''}")
+            result = pipeline.sync_directory(target_path, clear_first=clear, force=force, progress_cb=_progress)
             if result.success:
                 print_success(result.message)
                 if result.removed_files:
-                    click.echo(f"  已清理: {', '.join(result.removed_files)}")
+                    click.echo(f"  已清理 ({len(result.removed_files)}): {', '.join(result.removed_files)}")
                 if result.processed_files:
-                    click.echo(f"  已处理: {', '.join(result.processed_files)}")
+                    click.echo(f"  新增文件 ({len(result.processed_files)}): {', '.join(result.processed_files)}")
+                if result.updated_files:
+                    click.echo(f"  更新文件 ({len(result.updated_files)}): {', '.join(result.updated_files)}")
                 if result.skipped_files:
-                    click.echo(f"  已跳过: {', '.join(result.skipped_files)}")
+                    click.echo(f"  未变化跳过 ({len(result.skipped_files)}): {', '.join(result.skipped_files)}")
+                if result.failed_files:
+                    print_warn(f"  失败文件 ({len(result.failed_files)}): {', '.join(result.failed_files)}")
             else:
                 print_error(result.message)
                 sys.exit(1)
@@ -145,32 +174,71 @@ def ingest(path: Optional[str], clear: bool, force: bool):
 @cli.command()
 @click.argument("question")
 @click.option("--no-stream", is_flag=True, help="禁用流式输出")
-@click.option("--filter", "-f", "filter_file", default=None, help="按文件名过滤")
-def query(question: str, no_stream: bool, filter_file: Optional[str]):
+@click.option("--filter", "-f", "filter_file", default=None, help="按文件名过滤（精确匹配）")
+@click.option("--ext", "filter_ext", default=None, help="按扩展名过滤，如 .pdf / .docx")
+@click.option("--after", "updated_after", default=None, help="只查此时间后更新的文档 (YYYY-MM-DD 或时间戳)")
+@click.option("--before", "updated_before", default=None, help="只查此时间前更新的文档")
+@click.option("--retrieve-only", is_flag=True, help="仅返回检索到的来源片段，不调用 LLM")
+@click.option("--top-k", default=None, type=int, help="返回前 K 条结果")
+def query(
+    question: str,
+    no_stream: bool,
+    filter_file: Optional[str],
+    filter_ext: Optional[str],
+    updated_after: Optional[str],
+    updated_before: Optional[str],
+    retrieve_only: bool,
+    top_k: Optional[int],
+):
     from docurag.generation import LLMClient, PromptBuilder
     from docurag.ingestion import Embedder
-    from docurag.retrieval import Retriever, Reranker, VectorStore
+    from docurag.retrieval import (
+        RetrieveFilters,
+        Retriever,
+        Reranker,
+        VectorStore,
+    )
 
     try:
+        filters = RetrieveFilters(
+            file_name=filter_file,
+            file_ext=filter_ext,
+            updated_after=_parse_time_str(updated_after) if updated_after else None,
+            updated_before=_parse_time_str(updated_before) if updated_before else None,
+        )
+
         vector_store = VectorStore()
         embedder = Embedder()
         reranker = Reranker()
-        retriever = Retriever(vector_store, embedder, reranker)
-        prompt_builder = PromptBuilder()
-        llm_client = LLMClient()
+        retriever = Retriever(
+            vector_store,
+            embedder,
+            reranker,
+            **({"top_k": top_k, "rerank_top_k": min(top_k, 5)} if top_k else {}),
+        )
 
         if vector_store.count() == 0:
             print_error("向量库为空，请先运行 'docurag ingest' 摄入文档")
             sys.exit(1)
 
         click.echo(click.style("正在检索相关文档...", fg="cyan"))
-        retrieved = retriever.retrieve(question, filter_file=filter_file)
+        retrieved = retriever.retrieve(question, filters=filters)
 
         if not retrieved:
             print_answer("未找到相关信息")
             return
 
         sources = Retriever.format_sources(retrieved)
+
+        click.echo(click.style(f"\n命中 {len(retrieved)} 个相关片段:", fg="cyan", bold=True))
+        for i, src in enumerate(sources, 1):
+            print_source(src.get("file", "?"), src.get("page"), src.get("snippet", ""))
+
+        if retrieve_only:
+            return
+
+        prompt_builder = PromptBuilder()
+        llm_client = LLMClient()
         prompt = prompt_builder.build(question, retrieved)
 
         click.echo(click.style("\n答案:", fg="cyan", bold=True))
@@ -247,22 +315,28 @@ def query(question: str, no_stream: bool, filter_file: Optional[str]):
 @click.option("--host", "-h", default="127.0.0.1", help="监听地址")
 @click.option("--port", "-p", default=8000, type=int, help="监听端口")
 @click.option("--no-watch", is_flag=True, help="禁用 uploads 目录自动监听")
-def serve(host: str, port: int, no_watch: bool):
+@click.option("--no-auto-ingest", is_flag=True, help="启动时不自动摄入已有文件")
+def serve(host: str, port: int, no_watch: bool, no_auto_ingest: bool):
     import uvicorn
-    from docurag.api import set_auto_watch
+    from docurag.api import set_auto_watch, set_auto_ingest_on_start
 
     set_auto_watch(not no_watch)
+    set_auto_ingest_on_start(not no_auto_ingest)
 
     click.echo(f"启动 DocuRAG API 服务: http://{host}:{port}")
-    click.echo(f"  POST /query        - 问答接口")
-    click.echo(f"  GET  /ingest       - 触发文档同步")
-    click.echo(f"  GET  /status       - 查看状态")
-    click.echo(f"  GET  /docs         - 文件列表")
-    click.echo(f"  GET  /docs/{{name}} - 文件详情")
+    click.echo(f"  POST /query              - 问答接口")
+    click.echo(f"  GET  /ingest             - 触发文档同步")
+    click.echo(f"  GET  /status             - 查看状态")
+    click.echo(f"  GET  /doctor             - 审计诊断")
+    click.echo(f"  POST /doctor/fix         - 一键修复")
+    click.echo(f"  GET  /docs               - 文件列表")
+    click.echo(f"  GET  /docs/{{name}}       - 文件详情")
     click.echo(f"  POST /docs/{{name}}/ingest - 重新摄入单文件")
-    click.echo(f"  DELETE /docs/{{name}} - 删除单文件记录")
+    click.echo(f"  DELETE /docs/{{name}}     - 删除单文件记录")
     if not no_watch:
         click.echo(f"  自动监听: {UPLOAD_DIR} (新增/修改/删除/重命名自动同步)")
+    if not no_auto_ingest and not no_watch:
+        click.echo(f"  启动自动同步: uploads 已有文件自动入库")
 
     uvicorn.run("docurag.api:app", host=host, port=port, reload=False)
 
@@ -293,13 +367,24 @@ def list_files(short: bool):
             status = "在库中" if f.exists_in_uploads else "[已删除]"
             status_color = "green" if f.exists_in_uploads else "red"
             hash_short = f.file_hash[:16] if f.file_hash else "-"
+            last_status = f.last_ingest_status or "unknown"
+            status_map = {"added": "新增", "replaced": "更新", "skipped": "跳过", "failed": "失败", "": "-"}
+            status_label = status_map.get(last_status, last_status)
             try:
                 status_str = click.style(status, fg=status_color)
             except Exception:
                 status_str = status
 
             click.echo(f"  {f.filename}")
-            click.echo(f"    片段数: {f.chunk_count}  |  更新: {_format_time(f.updated_at)}  |  {status_str}")
+            click.echo(
+                f"    片段: {f.chunk_count}  |  更新: {_format_time(f.updated_at)}  |  {status_str}"
+                f"  |  上次: {status_label}"
+            )
+            if f.last_ingest_error:
+                click.echo(f"    错误: {f.last_ingest_error}")
+            if f.prev_chunk_count and f.prev_chunk_count != f.chunk_count:
+                delta = f.chunk_count - f.prev_chunk_count
+                click.echo(f"    上次片段数: {f.prev_chunk_count} (delta {delta:+d})")
             click.echo(f"    哈希: {hash_short}")
     except Exception as e:
         logging.exception("获取文件列表失败")
@@ -342,7 +427,8 @@ def remove(filename: str, yes: bool):
 
 @cli.command(name="sync")
 @click.option("--clear", "-c", is_flag=True, help="同步前清空向量库")
-def sync_cmd(clear: bool):
+@click.option("--force", "-f", is_flag=True, help="强制重建所有文件")
+def sync_cmd(clear: bool, force: bool):
     from docurag.ingestion import IngestionPipeline
 
     try:
@@ -351,23 +437,97 @@ def sync_cmd(clear: bool):
         def _progress(msg: str):
             click.echo(f"  {msg}")
 
-        click.echo(f"正在同步 uploads 目录: {UPLOAD_DIR}")
-        result = pipeline.sync_directory(UPLOAD_DIR, clear_first=clear, progress_cb=_progress)
+        click.echo(f"正在同步 uploads 目录: {UPLOAD_DIR} {'(强制重建)' if force else ''}")
+        result = pipeline.sync_directory(UPLOAD_DIR, clear_first=clear, force=force, progress_cb=_progress)
 
         if result.success:
             print_success(result.message)
             if result.removed_files:
                 click.echo(f"  已清理: {', '.join(result.removed_files)}")
             if result.processed_files:
-                click.echo(f"  已处理: {', '.join(result.processed_files)}")
+                click.echo(f"  新增: {', '.join(result.processed_files)}")
+            if result.updated_files:
+                click.echo(f"  更新: {', '.join(result.updated_files)}")
             if result.skipped_files:
-                click.echo(f"  已跳过: {', '.join(result.skipped_files)}")
+                click.echo(f"  跳过: {', '.join(result.skipped_files)}")
         else:
             print_error(result.message)
             sys.exit(1)
 
     except Exception as e:
         logging.exception("同步失败")
+        print_error(str(e))
+        sys.exit(1)
+
+
+@cli.command()
+@click.option("--fix", is_flag=True, help="发现问题后自动修复")
+@click.option("--yes", "-y", is_flag=True, help="修复时跳过确认")
+def doctor(fix: bool, yes: bool):
+    from docurag.ingestion import IngestionPipeline
+
+    try:
+        pipeline = IngestionPipeline()
+        report = pipeline.doctor(upload_dir=UPLOAD_DIR, watcher_running=False)
+
+        click.echo(click.style("DocuRAG 文档库诊断报告", fg="cyan", bold=True))
+        click.echo(f"  Uploads 目录: {report.upload_dir}")
+        click.echo(f"  向量库目录:  {report.db_dir}")
+        click.echo(f"  监听器状态:  {'运行中' if report.watcher_running else '未运行'}")
+        click.echo()
+        click.echo(f"  Uploads 支持文件数: {report.total_in_uploads}")
+        click.echo(f"  向量库文件数:      {report.total_in_db}")
+        click.echo()
+
+        issues = []
+
+        def _section(title: str, items: list, level: str = "warn"):
+            color = {"ok": "green", "warn": "yellow", "err": "red"}.get(level, "yellow")
+            if items:
+                issues.append((title, items))
+                try:
+                    click.echo(click.style(f"  [{title}] {len(items)} 项:", fg=color, bold=True))
+                except Exception:
+                    click.echo(f"  [{title}] {len(items)} 项:")
+                for it in items:
+                    click.echo(f"    - {it}")
+                click.echo()
+            else:
+                try:
+                    click.echo(click.style(f"  [{title}] 0 项 ✓", fg="green"))
+                except Exception:
+                    click.echo(f"  [{title}] 0 项 ✓")
+
+        _section("孤儿记录(库有目录无)", report.orphan_files, level="err")
+        _section("缺失文件(目录有库无)", report.missing_files, level="warn")
+        _section("哈希不一致(可能过期)", report.hash_mismatch, level="warn")
+        _section("文件较目录旧", report.stale_files, level="warn")
+        _section("空文件", report.empty_files, level="warn")
+        _section("不支持格式", report.unsupported_files, level="warn")
+
+        if not issues:
+            print_success("\n所有检查通过，文档库状态良好。")
+            return
+
+        if not fix:
+            print_warn("\n运行 'docurag doctor --fix' 自动修复上述问题。")
+            return
+
+        if not yes:
+            click.echo()
+            confirm = click.prompt("是否自动修复上述问题? (y/N)", default="N", show_default=False)
+            if confirm.lower() not in ("y", "yes"):
+                click.echo("已取消")
+                return
+
+        def _progress(msg: str):
+            click.echo(f"  {msg}")
+
+        result = pipeline.fix_doctor_issues(report, progress_cb=_progress)
+        print_success(f"\n{result.message}")
+
+    except Exception as e:
+        logging.exception("诊断失败")
         print_error(str(e))
         sys.exit(1)
 

@@ -17,7 +17,7 @@ class DirectoryWatcher:
         self,
         watch_dir: str | Path = UPLOAD_DIR,
         pipeline: Optional[IngestionPipeline] = None,
-        debounce_seconds: float = 2.0
+        debounce_seconds: float = 2.0,
     ):
         self.watch_dir = Path(watch_dir)
         self.pipeline = pipeline or IngestionPipeline()
@@ -30,7 +30,11 @@ class DirectoryWatcher:
         self._lock = threading.Lock()
         self._debounce_thread: Optional[threading.Thread] = None
 
-    def start(self):
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def start(self, ingest_existing: bool = True):
         if self._running:
             return
 
@@ -78,11 +82,14 @@ class DirectoryWatcher:
             self._debounce_thread.start()
 
             logger.info(f"目录监听器已启动: {self.watch_dir}")
-            self._scan_existing()
+
+            if ingest_existing:
+                self._scan_and_ingest_existing()
 
         except ImportError:
             logger.warning("watchdog 未安装，自动监听功能不可用。请运行: pip install watchdog")
-            self._scan_existing()
+            if ingest_existing:
+                self._scan_and_ingest_existing()
 
     def stop(self):
         self._running = False
@@ -106,19 +113,31 @@ class DirectoryWatcher:
                 except Exception:
                     pass
 
-    def _scan_existing(self):
+    def _scan_and_ingest_existing(self):
         self.watch_dir.mkdir(parents=True, exist_ok=True)
-        for f in sorted(self.watch_dir.iterdir()):
-            if f.is_file() and f.suffix.lower() in self._supported:
-                self._enqueue(str(f), check_hash=False)
+        files = [
+            f for f in sorted(self.watch_dir.iterdir())
+            if f.is_file() and f.suffix.lower() in self._supported
+        ]
+        if files:
+            logger.info(f"启动时发现 {len(files)} 个已有文件，开始自动同步...")
+            try:
+                result = self.pipeline.sync_directory(
+                    self.watch_dir,
+                    clear_first=False,
+                    force=False,
+                )
+                logger.info(f"启动同步完成: {result.message}")
+            except Exception as e:
+                logger.exception(f"启动同步失败: {e}")
 
-    def _enqueue(self, file_path: str, check_hash: bool = True):
+    def _enqueue(self, file_path: str):
         path = Path(file_path)
         if path.suffix.lower() not in self._supported:
             return
         with self._lock:
             self._pending_files[str(path)] = time.time()
-        logger.debug(f"文件变更已排队: {path.name} (check_hash={check_hash})")
+        logger.debug(f"文件变更已排队: {path.name}")
 
     def _on_deleted(self, file_path: str):
         path = Path(file_path)

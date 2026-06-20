@@ -1,7 +1,12 @@
 from .loader import DocumentLoader, DocumentChunk
 from .splitter import TextSplitter
 from .embedder import Embedder
-from .pipeline import IngestionPipeline, IngestResult, ProgressCallback
+from .pipeline import (
+    FileIngestDetail,
+    IngestionPipeline,
+    IngestResult,
+    ProgressCallback,
+)
 from .watcher import DirectoryWatcher
 
 __all__ = [
@@ -9,6 +14,7 @@ __all__ = [
     "DocumentChunk",
     "TextSplitter",
     "Embedder",
+    "FileIngestDetail",
     "IngestionPipeline",
     "IngestResult",
     "ProgressCallback",
